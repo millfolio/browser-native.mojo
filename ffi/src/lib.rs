@@ -19,10 +19,6 @@
 //! PRIVACY: redaction happens at CAPTURE. The injected JS never sends the value
 //! of a sensitive field (type=password, autocomplete one-time-code, etc.) — it
 //! sets redacted=1 and an empty value. Mojo's redact_event reinforces this.
-//!
-//! STATUS: skeleton. The C ABI + JS contract are final; the chromiumoxide calls
-//! marked `TODO(api)` need pinning to the exact crate version. Build opt-in via
-//! `pixi run ffi` (first build pulls chromiumoxide; needs a Chrome to exercise).
 
 use std::collections::VecDeque;
 use std::ffi::{c_char, CStr, CString};
@@ -30,9 +26,15 @@ use std::os::raw::c_void;
 use std::ptr;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use futures::StreamExt;
+use serde::Deserialize;
 use tokio::runtime::Runtime;
+use tokio::task::JoinHandle;
 
-// ── shared runtime + thread-local last error ──────────────────────────────────
+use chromiumoxide::cdp::js_protocol::runtime::{AddBindingParams, EventBindingCalled};
+use chromiumoxide::Browser;
+
+// ── shared runtime + thread-local strings ─────────────────────────────────────
 
 fn rt() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
@@ -67,9 +69,10 @@ pub extern "C" fn rec_last_error() -> *const c_char {
     LAST_ERR.with(|e| e.borrow().as_ptr())
 }
 
-// ── the recorder handle ───────────────────────────────────────────────────────
+// ── event row + pure (browser-independent) helpers ────────────────────────────
 
 /// One captured event, shim-internal (Mojo gets the TSV form).
+#[derive(Debug, Clone, PartialEq)]
 struct Row {
     kind: String,
     target: String,
@@ -80,12 +83,74 @@ struct Row {
     ts_ms: i64,
 }
 
-/// Live recording session. The background task pushes `Row`s into `queue`;
-/// `rec_poll` drains it.
+/// The JSON the injected `__rec` binding sends per event.
+#[derive(Deserialize)]
+struct Wire {
+    kind: String,
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    value: String,
+    #[serde(default)]
+    redacted: bool,
+    #[serde(default)]
+    ts: i64,
+}
+
+/// Parse one binding payload (`{kind,target,role,name,value,redacted,ts}`) to a
+/// `Row`. Returns None on malformed JSON. Defence-in-depth: even if the JS missed
+/// it, blank out the value of anything still flagged `redacted`.
+fn json_to_row(json: &str) -> Option<Row> {
+    let w: Wire = serde_json::from_str(json).ok()?;
+    let value = if w.redacted { String::new() } else { w.value };
+    Some(Row {
+        kind: w.kind,
+        target: w.target,
+        role: w.role,
+        name: w.name,
+        value,
+        redacted: w.redacted,
+        ts_ms: w.ts,
+    })
+}
+
+/// Render one `Row` as a TSV line (trailing `\n`). Tabs/newlines inside fields
+/// become spaces so the row framing the Mojo parser relies on stays intact.
+fn row_to_tsv(r: &Row) -> String {
+    let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        clean(&r.kind),
+        clean(&r.target),
+        clean(&r.role),
+        clean(&r.name),
+        clean(&r.value),
+        if r.redacted { "1" } else { "0" },
+        r.ts_ms,
+    )
+}
+
+fn push_json(queue: &Arc<Mutex<VecDeque<Row>>>, json: &str) {
+    if let Some(row) = json_to_row(json) {
+        if let Ok(mut q) = queue.lock() {
+            q.push_back(row);
+        }
+    }
+}
+
+// ── the recorder handle ───────────────────────────────────────────────────────
+
+/// Live recording session. Holds the CDP connection alive (`_browser`) and the
+/// background tasks (the CDP handler pump + the binding-event drain). The
+/// queue is shared with the drain task; `rec_poll` empties it.
 struct Recorder {
     queue: Arc<Mutex<VecDeque<Row>>>,
-    // Kept so Drop tears the CDP attachment + task down.
-    task: Option<tokio::task::JoinHandle<()>>,
+    _browser: Browser,
+    tasks: Vec<JoinHandle<()>>,
 }
 
 /// The capture-phase listener injected into every document. It computes a stable
@@ -102,7 +167,6 @@ const INJECT_JS: &str = r#"
     const hint = ((el.name||'') + ' ' + (el.getAttribute&&el.getAttribute('aria-label')||'')).toLowerCase();
     return /pass|otp|cvv|cvc|ssn|account number|card number|routing/.test(hint);
   };
-  // A short, reasonably-stable selector for replay (id > name > nth-of-type path).
   const sel = el => {
     if (!el || el.nodeType !== 1) return '';
     if (el.id) return '#' + el.id;
@@ -134,7 +198,6 @@ const INJECT_JS: &str = r#"
     else send('input', el, el.value);
   }, true);
   document.addEventListener('submit', e => send('submit', e.target), true);
-  // Initial navigation marker.
   window.__rec(JSON.stringify({kind:'navigate', target:'', role:'', name: location.href, value:'', redacted:false, ts: Date.now()}));
 })();
 "#;
@@ -161,67 +224,76 @@ pub unsafe extern "C" fn rec_start(cdp_url: *const c_char) -> *mut c_void {
     let queue: Arc<Mutex<VecDeque<Row>>> = Arc::new(Mutex::new(VecDeque::new()));
     let q = queue.clone();
 
-    // Connect + wire up the capture pipeline on the shared runtime. The async
-    // body returns a JoinHandle for the event pump.
-    let task = rt().block_on(async move {
-        // TODO(api): exact chromiumoxide calls depend on the crate version.
-        //   let (browser, mut handler) = Browser::connect(&url).await?;
-        //   tokio::spawn(async move { while handler.next().await.is_some() {} });
-        //   let page = browser.pages().await?.into_iter().next()...;
-        //   page.execute(AddScriptToEvaluateOnNewDocumentParams { source: INJECT_JS, .. }).await?;
-        //   page.execute(AddBindingParams { name: "__rec".into(), .. }).await?;   // Runtime.addBinding
-        //   page.evaluate(INJECT_JS).await?;                                       // inject into the live page too
-        //   let mut binding_events = page.event_listener::<EventBindingCalled>().await?;
-        //   tokio::spawn(async move {
-        //       while let Some(ev) = binding_events.next().await {
-        //           if ev.name == "__rec" { push_json(&q, &ev.payload); }
-        //       }
-        //   })
-        let _ = (&url, INJECT_JS); // silence unused until the calls above land
-        let _ = &q;
-        set_err("rec_start: chromiumoxide wiring is a skeleton — fill the TODO(api) block");
-        tokio::spawn(async {})
-    });
+    let built = rt().block_on(async move { connect_and_capture(&url, q).await });
 
-    let rec = Box::new(Recorder {
-        queue,
-        task: Some(task),
-    });
-    Box::into_raw(rec) as *mut c_void
+    match built {
+        Ok((browser, tasks)) => Box::into_raw(Box::new(Recorder {
+            queue,
+            _browser: browser,
+            tasks,
+        })) as *mut c_void,
+        Err(e) => {
+            set_err(format!("rec_start: {e}"));
+            ptr::null_mut()
+        }
+    }
 }
 
-/// Map the JSON `{kind,target,role,name,value,redacted,ts}` the JS binding sent
-/// into a `Row`. (Hand-rolled extraction keeps the dep tree tiny; swap for
-/// serde_json if you'd rather.)
-#[allow(dead_code)]
-fn push_json(queue: &Arc<Mutex<VecDeque<Row>>>, _json: &str) {
-    // TODO: parse `_json` (serde_json::from_str) into a Row and push.
-    let _ = queue;
+/// Connect to the running Chrome, add the `__rec` binding, inject the capture
+/// script into the current + future documents, and spawn the pumps. Returns the
+/// live `Browser` (kept alive by the caller) and the background task handles.
+async fn connect_and_capture(
+    url: &str,
+    queue: Arc<Mutex<VecDeque<Row>>>,
+) -> Result<(Browser, Vec<JoinHandle<()>>), String> {
+    let (browser, mut handler) = Browser::connect(url).await.map_err(|e| e.to_string())?;
+
+    // Drive the CDP connection: the handler future must be polled for anything
+    // (commands, events) to make progress.
+    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+
+    // Attach to whatever page is open (the session the user is operating).
+    let pages = browser.pages().await.map_err(|e| e.to_string())?;
+    let page = pages.into_iter().next().ok_or("no open page in target")?;
+
+    // Runtime.addBinding("__rec") exposes window.__rec(json) -> a bindingCalled event.
+    page.execute(AddBindingParams::new("__rec"))
+        .await
+        .map_err(|e| e.to_string())?;
+    // Inject for future navigations AND the current document.
+    page.evaluate_on_new_document(INJECT_JS)
+        .await
+        .map_err(|e| e.to_string())?;
+    let _ = page.evaluate(INJECT_JS).await; // best-effort for the live doc
+
+    // Drain bindingCalled events into the queue.
+    let mut events = page
+        .event_listener::<EventBindingCalled>()
+        .await
+        .map_err(|e| e.to_string())?;
+    let drain_task = tokio::spawn(async move {
+        while let Some(ev) = events.next().await {
+            if ev.name == "__rec" {
+                push_json(&queue, &ev.payload);
+            }
+        }
+    });
+
+    Ok((browser, vec![handler_task, drain_task]))
 }
 
 /// Drain queued events into a TSV batch (NUL-terminated, shim-owned). Empty when
-/// nothing is pending. Tabs/newlines in field text are replaced with spaces so
-/// the row framing stays intact.
+/// nothing is pending.
 ///
 /// # Safety
 /// `handle` must be a live pointer from `rec_start`.
 #[no_mangle]
 pub unsafe extern "C" fn rec_poll(handle: *mut c_void) -> *const c_char {
-    let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
     let mut out = String::new();
     if let Some(rec) = (handle as *mut Recorder).as_ref() {
         if let Ok(mut q) = rec.queue.lock() {
             while let Some(r) = q.pop_front() {
-                out.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                    clean(&r.kind),
-                    clean(&r.target),
-                    clean(&r.role),
-                    clean(&r.name),
-                    clean(&r.value),
-                    if r.redacted { "1" } else { "0" },
-                    r.ts_ms,
-                ));
+                out.push_str(&row_to_tsv(&r));
             }
         }
     }
@@ -240,9 +312,75 @@ pub unsafe extern "C" fn rec_stop(handle: *mut c_void) {
     if handle.is_null() {
         return;
     }
-    let mut rec = Box::from_raw(handle as *mut Recorder);
-    if let Some(t) = rec.task.take() {
+    let rec = Box::from_raw(handle as *mut Recorder);
+    for t in &rec.tasks {
         t.abort();
     }
-    // Browser/connection drop here tears down the CDP attachment.
+    // `rec` (and the Browser it owns) drops here, tearing down the CDP attachment.
+}
+
+// ── unit tests for the pure, browser-independent logic ────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_to_row_parses_a_click() {
+        let r = json_to_row(
+            r#"{"kind":"click","target":"@e7","role":"link","name":"Statements","value":"","redacted":false,"ts":200}"#,
+        )
+        .unwrap();
+        assert_eq!(r.kind, "click");
+        assert_eq!(r.target, "@e7");
+        assert_eq!(r.name, "Statements");
+        assert_eq!(r.ts_ms, 200);
+        assert!(!r.redacted);
+    }
+
+    #[test]
+    fn json_to_row_blanks_redacted_value() {
+        // Defence in depth: a redacted=true row must never carry a value, even
+        // if one slipped through.
+        let r = json_to_row(
+            r##"{"kind":"input","target":"#p","role":"password","name":"Password","value":"hunter2","redacted":true,"ts":1}"##,
+        )
+        .unwrap();
+        assert!(r.redacted);
+        assert_eq!(r.value, "");
+    }
+
+    #[test]
+    fn json_to_row_rejects_garbage() {
+        assert!(json_to_row("not json").is_none());
+        assert!(json_to_row("{}").is_none()); // missing required `kind`
+    }
+
+    #[test]
+    fn row_to_tsv_is_framed_and_clean() {
+        let r = Row {
+            kind: "input".into(),
+            target: "#e".into(),
+            role: "textbox".into(),
+            name: "Sea\trch\nbox".into(), // embedded tab/newline must be neutralised
+            value: "a@b.com".into(),
+            redacted: false,
+            ts_ms: 42,
+        };
+        let line = row_to_tsv(&r);
+        assert!(line.ends_with('\n'));
+        assert_eq!(line.matches('\t').count(), 6, "exactly 6 field separators");
+        assert!(!line[..line.len() - 1].contains('\n'), "no stray newlines");
+        assert!(line.contains("Sea rch box"));
+        assert!(line.contains("\t0\t42\n"), "redacted flag + ts tail");
+    }
+
+    #[test]
+    fn push_json_enqueues_valid_only() {
+        let q: Arc<Mutex<VecDeque<Row>>> = Arc::new(Mutex::new(VecDeque::new()));
+        push_json(&q, r#"{"kind":"submit","ts":5}"#);
+        push_json(&q, "garbage");
+        assert_eq!(q.lock().unwrap().len(), 1);
+        assert_eq!(q.lock().unwrap()[0].kind, "submit");
+    }
 }
