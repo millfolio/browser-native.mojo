@@ -36,6 +36,16 @@ from browser_native import (
     FAIL_STALE_REF,
     FAIL_USAGE,
     FAIL_NOT_INSTALLED,
+    Event,
+    parse_events,
+    record_to_job,
+    event_to_step,
+    is_sensitive_field,
+    redact_event,
+    EV_CLICK,
+    EV_INPUT,
+    EV_NAVIGATE,
+    REDACTED_FILL,
 )
 from browser_native.proc import run_shell
 
@@ -360,6 +370,127 @@ def test_run_shell_exit_code() raises:
     _expect(out.exit_code == 3, "non-zero exit code recovered")
 
 
+# ── recorder seam (pure parts) ────────────────────────────────────────────────
+
+
+def test_parse_events() raises:
+    var wire = (
+        "navigate\t\t\thttps://bank.example\t\t0\t100\n"
+        + "click\t@e7\tlink\tStatements\t\t0\t200\n"
+        + "input\t#email\ttextbox\tEmail\ta@b.com\t0\t300\n"
+    )
+    var evs = parse_events(wire)
+    _expect(len(evs) == 3, "parsed 3 events")
+    _expect(evs[0].kind == EV_NAVIGATE, "event 0 is navigate")
+    _expect(evs[0].name == "https://bank.example", "navigate carries url")
+    _expect(evs[1].target == "@e7" and evs[1].name == "Statements", "click ref")
+    _expect(evs[2].value == "a@b.com" and not evs[2].redacted, "input value")
+
+
+def test_parse_events_skips_malformed() raises:
+    var evs = parse_events("click\t@e1\n\nbad\trow\n")
+    _expect(len(evs) == 0, "rows with <7 fields are skipped")
+
+
+def test_is_sensitive_field() raises:
+    _expect(
+        is_sensitive_field(
+            Event("input", "#p", "password", "Password", "", False, 0)
+        ),
+        "role=password is sensitive",
+    )
+    _expect(
+        is_sensitive_field(
+            Event("input", "#o", "textbox", "OTP code", "", False, 0)
+        ),
+        "OTP field is sensitive",
+    )
+    _expect(
+        not is_sensitive_field(
+            Event("input", "#e", "textbox", "Email", "", False, 0)
+        ),
+        "email field is not sensitive",
+    )
+
+
+def test_redact_event() raises:
+    var pw = redact_event(
+        Event("input", "#p", "password", "Password", "hunter2", False, 0)
+    )
+    _expect(pw.redacted and pw.value == "«redacted»", "password value masked")
+    var email = redact_event(
+        Event("input", "#e", "textbox", "Email", "a@b.com", False, 0)
+    )
+    _expect(email.value == "a@b.com", "benign value kept")
+    var click = redact_event(
+        Event("click", "@e1", "button", "Go", "", False, 0)
+    )
+    _expect(click.value == "", "non-input untouched")
+
+
+def test_event_to_step() raises:
+    var nav = event_to_step(
+        Event("navigate", "", "", "https://x.com", "", False, 0)
+    )
+    _expect(len(nav) == 1 and nav[0].op == "open", "navigate → open")
+    var click = event_to_step(
+        Event("click", "@e3", "button", "Go", "", False, 0)
+    )
+    _expect(
+        click[0].op == "click" and click[0].arg == "@e3", "click → click ref"
+    )
+    var key = event_to_step(Event("key", "", "", "Tab", "", False, 0))
+    _expect(len(key) == 0, "noise key → no step")
+
+
+def test_record_to_job_redacted_fill() raises:
+    var evs = List[Event]()
+    evs.append(Event("input", "#p", "password", "Password", "secret", False, 0))
+    var job = record_to_job(evs)
+    _expect(len(job) == 1 and job[0].op == "fill", "password → fill step")
+    _expect(
+        job[0].input == REDACTED_FILL,
+        "redacted fill carries the prompt-at-replay sentinel, not the secret",
+    )
+
+
+def test_record_to_job_coalesces_keystrokes() raises:
+    var evs = List[Event]()
+    evs.append(Event("input", "#email", "textbox", "Email", "a", False, 1))
+    evs.append(Event("input", "#email", "textbox", "Email", "a@", False, 2))
+    evs.append(
+        Event("input", "#email", "textbox", "Email", "a@b.com", False, 3)
+    )
+    var job = record_to_job(evs)
+    _expect(
+        len(job) == 1, "consecutive fills on one field coalesce to one step"
+    )
+    _expect(job[0].input == "a@b.com", "coalesced to the final typed value")
+
+
+def test_record_to_job_full_flow() raises:
+    # A realistic bank-download capture → replayable job.
+    var evs = List[Event]()
+    evs.append(
+        Event("navigate", "", "", "https://bank.example/login", "", False, 1)
+    )
+    evs.append(
+        Event("input", "#user", "textbox", "Username", "alice", False, 2)
+    )
+    evs.append(
+        Event("input", "#pass", "password", "Password", "p@ss", False, 3)
+    )
+    evs.append(Event("click", "@e9", "button", "Sign in", "", False, 4))
+    evs.append(
+        Event("click", "@e21", "link", "Download statement", "", False, 5)
+    )
+    var job = record_to_job(evs)
+    _expect(len(job) == 5, "5 steps recorded")
+    _expect(job[0].op == "open", "step 0 opens the login url")
+    _expect(job[2].input == REDACTED_FILL, "password never stored in the job")
+    _expect(job[4].arg == "@e21", "final step clicks the download link")
+
+
 def main() raises:
     test_compile_args()
     test_compile_session_flags()
@@ -389,4 +520,12 @@ def main() raises:
     test_trim_body()
     test_run_shell_echo()
     test_run_shell_exit_code()
+    test_parse_events()
+    test_parse_events_skips_malformed()
+    test_is_sensitive_field()
+    test_redact_event()
+    test_event_to_step()
+    test_record_to_job_redacted_fill()
+    test_record_to_job_coalesces_keystrokes()
+    test_record_to_job_full_flow()
     print("all browser_native tests passed")

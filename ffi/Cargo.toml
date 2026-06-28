@@ -1,0 +1,22 @@
+[package]
+name = "browsernativerec"
+version = "0.1.0"
+edition = "2021"
+description = "C-ABI CDP recorder shim for browser-native.mojo — captures the user's click/type/navigate events from a live Chrome (the one agent-browser drives) via chromiumoxide, and hands them to Mojo over a tiny C ABI."
+
+[lib]
+name = "browsernativerec"
+# cdylib -> libbrowsernativerec.dylib, loaded by Mojo via OwnedDLHandle, exactly
+# like the lancedb.mojo / flare TLS shims.
+crate-type = ["cdylib"]
+
+[dependencies]
+# chromiumoxide is the mature async-Rust CDP client. agent-browser ALSO speaks
+# CDP (pure Rust, no Node) — so the recorder attaches to the same Chrome as a
+# second CDP client and only OBSERVES (driving/replay stays with agent-browser).
+chromiumoxide = { version = "0.7", features = ["tokio-runtime"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures = "0.3"
+
+[profile.release]
+opt-level = 2

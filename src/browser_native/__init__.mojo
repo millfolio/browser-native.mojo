@@ -78,3 +78,22 @@ from browser_native.result import (
 
 # The end-to-end pipeline.
 from browser_native.run import run, DEFAULT_BIN
+
+# Recorder seam (observe the user's actions → replayable job). The pure parsing /
+# mapping / redaction is usable without the FFI shim; `Recorder` needs `ffi/`.
+from browser_native.record import (
+    Event,
+    Recorder,
+    parse_events,
+    record_to_job,
+    event_to_step,
+    is_sensitive_field,
+    redact_event,
+    EV_CLICK,
+    EV_INPUT,
+    EV_NAVIGATE,
+    EV_SUBMIT,
+    EV_SELECT,
+    EV_KEY,
+    REDACTED_FILL,
+)

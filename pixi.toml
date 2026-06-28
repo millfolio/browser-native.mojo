@@ -19,3 +19,6 @@ mojo = "==1.0.0b3.dev2026062706"
 # `-I ../browser-native.mojo/src` and `from browser_native import *`.
 test = { cmd = "mkdir -p build && mojo build test/browser_native_test.mojo -I src -o build/browser-native-test && ./build/browser-native-test" }
 build-cli = { cmd = "mkdir -p build && mojo build src/main.mojo -I src -o build/browser-native" }
+# The recorder shim (libbrowsernativerec.dylib) — OPT-IN: only needed for the
+# live `Recorder`. The library, CLI, and tests build/run without it (pure parts).
+ffi = { cmd = "bash ffi/build.sh" }
