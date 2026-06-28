@@ -1,0 +1,21 @@
+[workspace]
+name = "browser-native"
+version = "0.1.0"
+authors = ["Marius S <marius@seritan.net>"]
+description = "A native, agent-friendly Mojo wrapper around the upstream `agent-browser` CLI — compiles structured browser requests to argv, runs the engine, then redacts secrets and categorizes the result for reliable agent branching. A Mojo port of fitchmultz/pi-agent-browser-native."
+# Org nightly — matches the other millfolio Mojo libs so it resolves via `-I`
+# against the same shared toolchain.
+channels = [
+    "https://conda.modular.com/max-nightly",
+    "conda-forge",
+]
+platforms = ["osx-arm64"]
+
+[dependencies]
+mojo = "==1.0.0b3.dev2026062706"
+
+[tasks]
+# Pure Mojo + libc FFI (popen/pclose), no extra deps — consumers just
+# `-I ../browser-native.mojo/src` and `from browser_native import *`.
+test = { cmd = "mkdir -p build && mojo build test/browser_native_test.mojo -I src -o build/browser-native-test && ./build/browser-native-test" }
+build-cli = { cmd = "mkdir -p build && mojo build src/main.mojo -I src -o build/browser-native" }
