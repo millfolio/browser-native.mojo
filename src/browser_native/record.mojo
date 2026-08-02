@@ -268,9 +268,7 @@ struct Recorder(Movable):
         self.lib = OwnedDLHandle(_find_lib())
         self.events = List[Event]()
         var url_c = _cstr(cdp_url)
-        var start = self.lib.get_function[def(Int) thin abi("C") -> Int](
-            "rec_start"
-        )
+        var start = self.lib.get_function[Int]("rec_start")
         self.handle = start(Int(url_c.unsafe_ptr()))
         _ = url_c^  # keep the buffer mapped across the C call
         if self.handle == 0:
@@ -279,9 +277,9 @@ struct Recorder(Movable):
     def poll(mut self) raises -> Int:
         """Drain newly-captured events from the shim into `self.events`; returns
         how many were appended. Call on a cadence while the user works."""
-        var f = self.lib.get_function[
-            def(Int) thin abi("C") -> UnsafePointer[UInt8, MutAnyOrigin]
-        ]("rec_poll")
+        var f = self.lib.get_function[UnsafePointer[UInt8, MutAnyOrigin]](
+            "rec_poll"
+        )
         var batch = parse_events(_read_cstr(f(self.handle)))
         var added = len(batch)
         for i in range(added):
@@ -292,25 +290,26 @@ struct Recorder(Movable):
         """The replayable `job` for everything captured so far."""
         return record_to_job(self.events)
 
-    def stop(mut self):
+    def stop(mut self) raises:
         if self.handle != 0:
-            var f = self.lib.get_function[def(Int) thin abi("C") -> None](
-                "rec_stop"
-            )
+            var f = self.lib.get_function[NoneType]("rec_stop")
             f(self.handle)
             self.handle = 0
 
     def __del__(deinit self):
         # Free the session while `self.lib` is still mapped.
+        # get_function raises if the symbol is missing; a destructor can't
+        # propagate that, so treat a missing symbol as a no-op.
         if self.handle != 0:
-            var f = self.lib.get_function[def(Int) thin abi("C") -> None](
-                "rec_stop"
-            )
-            f(self.handle)
+            try:
+                var f = self.lib.get_function[NoneType]("rec_stop")
+                f(self.handle)
+            except:
+                pass
 
 
-def _last_error(read lib: OwnedDLHandle) -> String:
-    var func = lib.get_function[
-        def() thin abi("C") -> UnsafePointer[UInt8, MutAnyOrigin]
-    ]("rec_last_error")
+def _last_error(read lib: OwnedDLHandle) raises -> String:
+    var func = lib.get_function[UnsafePointer[UInt8, MutAnyOrigin]](
+        "rec_last_error"
+    )
     return _read_cstr(func())
