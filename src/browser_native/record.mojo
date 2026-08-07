@@ -301,14 +301,11 @@ struct Recorder(Movable):
         # get_function raises if the symbol is missing; a destructor can't
         # propagate that, so treat a missing symbol as a no-op.
         if self.handle != 0:
-            try:
-                var f = self.lib.get_function[NoneType]("rec_stop")
-                f(self.handle)
-            except:
-                pass
+            var f = self.lib.get_function[NoneType]("rec_stop")
+            f(self.handle)
 
 
-def _last_error(read lib: OwnedDLHandle) raises -> String:
+def _last_error(read lib: OwnedDLHandle) -> String:
     var func = lib.get_function[UnsafePointer[UInt8, MutAnyOrigin]](
         "rec_last_error"
     )

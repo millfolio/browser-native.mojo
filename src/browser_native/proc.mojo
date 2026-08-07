@@ -14,7 +14,7 @@ message instead of a crash.
 from std.ffi import external_call, c_int
 from std.memory import UnsafePointer
 
-comptime _FilePtr = UnsafePointer[NoneType, MutUntrackedOrigin]
+comptime _FilePtr = Pointer[NoneType, MutUntrackedOrigin]
 comptime _CHUNK: Int = 8192
 
 
