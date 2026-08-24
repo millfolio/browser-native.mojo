@@ -1,0 +1,6 @@
+name = "browser-native"
+version = "0.1.0"
+description = "An agent-friendly Mojo wrapper around the agent-browser CLI, with secret redaction and categorized results"
+tags = ["browser", "automation", "agents"]
+# other books this one depends on; omit if none
+books = []
